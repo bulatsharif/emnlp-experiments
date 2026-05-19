@@ -1,2 +1,4 @@
 Dream-org
 ParallelBench
+outputs/
+__pycache__/

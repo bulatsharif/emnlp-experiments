@@ -81,3 +81,4 @@ def print_summary(summary: dict) -> None:
             f"{i:>3}  {row['n']:>4}  {row['cos_mean']:.6f}  "
             f"[{row['cos_min']:.6f}, {row['cos_max']:.6f}]  {row['kl_mean']:.6f}"
         )
+

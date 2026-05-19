@@ -1,4 +1,4 @@
-"""Compatibility helpers for probing local Dream checkpoints."""
+"""Dream model loading and forward helpers."""
 
 from __future__ import annotations
 
@@ -12,6 +12,10 @@ import torch
 
 
 FORCE_MATH_SDPA = False
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
 
 def resolve_shift_logits(mode: str, model_name: str) -> bool:
@@ -30,14 +34,13 @@ def _configure_hf_cache() -> None:
 
 def _add_project_venv_to_path() -> None:
     _configure_hf_cache()
-    root = Path(__file__).resolve().parents[1]
     candidates = [
-        root
+        repo_root()
         / ".venv"
         / "lib"
         / f"python{sys.version_info.major}.{sys.version_info.minor}"
         / "site-packages",
-        root / ".venv" / "Lib" / "site-packages",
+        repo_root() / ".venv" / "Lib" / "site-packages",
     ]
     for path in candidates:
         if path.exists():
@@ -77,7 +80,7 @@ def _patch_rope_default() -> None:
 
 
 def _patch_generation_update() -> None:
-    """DreamGenerationConfig.validate ignores new HF kwargs."""
+    """DreamGenerationConfig.validate ignores newer HF kwargs."""
     try:
         from transformers.generation.configuration_utils import GenerationConfig
     except Exception:
@@ -122,6 +125,12 @@ def _configure_attention(device: str, backend: str) -> None:
         pass
 
 
+def _torch_dtype(name: str, device: str):
+    if name == "auto":
+        return torch.bfloat16 if device.startswith("cuda") else torch.float32
+    return getattr(torch, name)
+
+
 def load_dream_model(args):
     _configure_hf_cache()
     try:
@@ -141,18 +150,17 @@ def load_dream_model(args):
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
     if device == "auto":
         device = "cpu"
-    dtype = torch.bfloat16 if args.dtype == "auto" and device.startswith("cuda") else (
-        torch.float32 if args.dtype == "auto" else getattr(torch, args.dtype)
-    )
     _configure_attention(device, args.sdpa_backend)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_id, trust_remote_code=True, local_files_only=not args.allow_downloads
+        model_id,
+        trust_remote_code=True,
+        local_files_only=not args.allow_downloads,
     )
     model = AutoModel.from_pretrained(
         model_id,
         trust_remote_code=True,
-        torch_dtype=dtype,
+        torch_dtype=_torch_dtype(args.dtype, device),
         local_files_only=not args.allow_downloads,
     ).to(device)
     model.eval()
@@ -170,7 +178,9 @@ def load_dream_model(args):
 
 def forward_logits_hidden(model, input_ids, shift_logits: bool):
     position_ids = torch.arange(
-        input_ids.shape[-1], dtype=torch.long, device=input_ids.device
+        input_ids.shape[-1],
+        dtype=torch.long,
+        device=input_ids.device,
     ).unsqueeze(0).expand(input_ids.shape[0], -1)
 
     context = nullcontext()
@@ -199,3 +209,4 @@ def forward_logits_hidden(model, input_ids, shift_logits: bool):
     if isinstance(hidden, (tuple, list)):
         hidden = hidden[-1]
     return logits, hidden
+
