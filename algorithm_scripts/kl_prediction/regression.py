@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -125,6 +126,37 @@ def linear_kl_probe(
     }
 
 
+def linear_kl_probe_by_task(
+    records: list[dict],
+    features: list[torch.Tensor],
+    targets: list[float],
+    train_fraction: float,
+    ridge: float,
+    seed: int,
+) -> dict[str, dict]:
+    groups = _group_by_task(records, features, targets)
+    return {
+        task: linear_kl_probe(group_features, group_targets, train_fraction, ridge, seed)
+        for task, (group_features, group_targets) in groups.items()
+    }
+
+
+def _group_by_task(
+    records: list[dict],
+    features: list[torch.Tensor],
+    targets: list[float],
+) -> dict[str, tuple[list[torch.Tensor], list[float]]]:
+    if len(records) != len(features):
+        return {"all": (features, targets)}
+
+    groups = defaultdict(lambda: ([], []))
+    for record, feature, target in zip(records, features, targets):
+        task = str(record.get("task") or "unknown")
+        groups[task][0].append(feature)
+        groups[task][1].append(target)
+    return dict(groups)
+
+
 def catboost_kl_probe(
     features: list[torch.Tensor],
     targets: list[float],
@@ -201,6 +233,24 @@ def print_linear_probe_summary(summary: dict) -> None:
     _print_metrics(summary)
 
 
+def print_linear_probe_by_task_summary(summaries: dict[str, dict]) -> None:
+    print("\n=== per-task linear hidden-state KL predictors ===")
+    for task, summary in sorted(summaries.items()):
+        print(f"\n[{task}]")
+        if not summary["ok"]:
+            print(f"skipped: {summary['reason']}")
+            continue
+        print(
+            f"features: [anchor_hidden, target_hidden] "
+            f"hidden_dim={summary['hidden_dim']} feature_dim={summary['feature_dim']}"
+        )
+        print(
+            f"split:    train={summary['train_n']} test={summary['test_n']} "
+            f"ridge={summary['ridge']:.6g}"
+        )
+        _print_metrics(summary)
+
+
 def print_catboost_probe_summary(summary: dict) -> None:
     print("\n=== CatBoost hidden-state KL predictor ===")
     if not summary["ok"]:
@@ -235,4 +285,3 @@ def load_feature_file(path: Path) -> tuple[list[dict], list[torch.Tensor], list[
     features = [row.detach().cpu() for row in payload["features"]]
     targets = [float(value) for value in payload["kl"].tolist()]
     return payload.get("records", []), features, targets
-

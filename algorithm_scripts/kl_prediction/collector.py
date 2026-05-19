@@ -71,6 +71,7 @@ def pair_kl_records(
     x: torch.Tensor,
     mask_pos: torch.Tensor,
     generation_start: int,
+    task: str,
     step: int,
     sample_idx: int,
     mask_id: int,
@@ -132,7 +133,7 @@ def pair_kl_records(
             kl_targets.append(float(kl))
             records.append(
                 {
-                    "task": "waiting_line/shuffle",
+                    "task": task,
                     "sample_idx": sample_idx,
                     "step": step,
                     "pair_i": int(mask_pos[i]) - generation_start,
@@ -154,7 +155,14 @@ def pair_kl_records(
 
 
 @torch.no_grad()
-def probe_sample(model, input_ids: torch.Tensor, mask_id: int, sample_idx: int, args):
+def probe_sample(
+    model,
+    input_ids: torch.Tensor,
+    mask_id: int,
+    sample_idx: int,
+    task: str,
+    args,
+):
     x = input_ids.clone()
     start = int((x[0] == mask_id).nonzero().flatten()[0])
     rows = []
@@ -171,6 +179,7 @@ def probe_sample(model, input_ids: torch.Tensor, mask_id: int, sample_idx: int, 
             x=x,
             mask_pos=mask_pos,
             generation_start=start,
+            task=task,
             step=step,
             sample_idx=sample_idx,
             mask_id=mask_id,
@@ -185,4 +194,3 @@ def probe_sample(model, input_ids: torch.Tensor, mask_id: int, sample_idx: int, 
         targets.extend(kl_targets)
         x[0, mask_pos[scheduled]] = top_ids[scheduled]
     return rows, features, targets
-
