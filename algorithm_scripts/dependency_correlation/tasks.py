@@ -7,11 +7,14 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from algorithm_scripts.kl_prediction.shuffle_data import load_shuffle_sample
+from algorithm_scripts.kl_prediction.shuffle_data import load_shuffle_sample, load_waiting_line_sample
 
 
 HUMANEVAL_IDS = (("openai_humaneval", None), ("openai/openai_humaneval", None))
 GSM8K_IDS = (("openai/gsm8k", "main"), ("gsm8k", "main"))
+MATH500_IDS = (("HuggingFaceH4/MATH-500", None),)
+IFEVAL_IDS = (("google/IFEval", None),)
+MTBENCH_IDS = (("HuggingFaceH4/mt_bench_prompts", None),)
 
 
 @dataclass
@@ -92,6 +95,120 @@ def load_gsm8k(path: Path | None, count: int, offset: int) -> list[Sample]:
     return out
 
 
+def load_math500(path: Path | None, count: int, offset: int) -> list[Sample]:
+    rows = (
+        _read_jsonl(path, count, offset)
+        if path
+        else _load_hf(MATH500_IDS, "test", count, offset)
+    )
+    out = []
+    for idx, row in rows:
+        problem = row.get("problem") or row.get("question") or row.get("prompt") or row.get("text")
+        target = row.get("answer") or row.get("solution") or ""
+        if not problem:
+            continue
+        out.append(
+            _single_user(
+                "math500",
+                "Solve the competition math problem. Give the final answer.\n\n" + problem,
+                target,
+                {
+                    "sample_idx": idx,
+                    "subject": row.get("subject"),
+                    "level": row.get("level"),
+                    "unique_id": row.get("unique_id"),
+                },
+            )
+        )
+    return out
+
+
+def load_ifeval(path: Path | None, count: int, offset: int) -> list[Sample]:
+    rows = (
+        _read_jsonl(path, count, offset)
+        if path
+        else _load_hf(IFEVAL_IDS, "train", count, offset)
+    )
+    out = []
+    for idx, row in rows:
+        prompt = row.get("prompt") or row.get("question") or row.get("text")
+        if not prompt:
+            continue
+        out.append(
+            _single_user(
+                "ifeval",
+                prompt,
+                "",
+                {
+                    "sample_idx": idx,
+                    "key": row.get("key"),
+                    "instruction_id_list": row.get("instruction_id_list"),
+                },
+            )
+        )
+    return out
+
+
+def load_mtbench(path: Path | None, count: int, offset: int) -> list[Sample]:
+    rows = (
+        list(_read_jsonl_all(path))
+        if path
+        else list(_load_hf(MTBENCH_IDS, "train", 10**9, 0))
+    )
+    out = []
+    flat_idx = 0
+    for row_idx, row in rows:
+        prompts = (
+            row.get("prompt")
+            or row.get("prompts")
+            or row.get("turns")
+            or row.get("question")
+            or row.get("text")
+        )
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        if not prompts:
+            continue
+        for turn_idx, prompt in enumerate(prompts, start=1):
+            if flat_idx < offset:
+                flat_idx += 1
+                continue
+            if len(out) >= count:
+                return out
+            out.append(
+                _single_user(
+                    "mtbench",
+                    str(prompt),
+                    "",
+                    {
+                        "sample_idx": flat_idx,
+                        "source_row_idx": row_idx,
+                        "prompt_id": row.get("prompt_id") or row.get("question_id") or row.get("id"),
+                        "category": row.get("category"),
+                        "turn_idx": turn_idx,
+                        "num_turns": len(prompts),
+                    },
+                )
+            )
+            flat_idx += 1
+    return out
+
+
+def load_parallelbench_copy(root: Path, count: int, offset: int, seed: int) -> list[Sample]:
+    out = []
+    for idx in range(offset, offset + count):
+        sample = load_waiting_line_sample(root, "copy", idx, seed)
+        out.append(
+            Sample(
+                task="parallelbench_copy",
+                messages=sample.messages,
+                target=sample.target,
+                metadata={"sample_idx": idx, **sample.metadata},
+            )
+        )
+    return out
+
+
 def _read_jsonl(path: Path, count: int, offset: int):
     with path.open() as handle:
         for idx, line in enumerate(handle):
@@ -99,6 +216,12 @@ def _read_jsonl(path: Path, count: int, offset: int):
                 continue
             if idx >= offset + count:
                 break
+            yield idx, json.loads(line)
+
+
+def _read_jsonl_all(path: Path):
+    with path.open() as handle:
+        for idx, line in enumerate(handle):
             yield idx, json.loads(line)
 
 

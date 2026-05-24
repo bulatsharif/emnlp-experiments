@@ -20,13 +20,41 @@ def _cosine_matrix(x: torch.Tensor) -> torch.Tensor:
     return torch.abs(F.normalize(x.float(), p=2, dim=-1) @ F.normalize(x.float(), p=2, dim=-1).T)
 
 
+def _attention_matrix(
+    attentions,
+    mask_pos: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    if attentions is None:
+        size = int(mask_pos.numel())
+        return torch.full((size, size), torch.nan, dtype=torch.float32, device=device)
+
+    if isinstance(attentions, (tuple, list)):
+        attentions = torch.stack([layer.float() for layer in attentions], dim=0)
+    else:
+        attentions = attentions.float()
+
+    if attentions.dim() != 5:
+        size = int(mask_pos.numel())
+        return torch.full((size, size), torch.nan, dtype=torch.float32, device=device)
+
+    mean_attention = attentions.mean(dim=0).mean(dim=1)[0]
+    mask_attention = mean_attention.index_select(0, mask_pos).index_select(1, mask_pos)
+    return 0.5 * (mask_attention + mask_attention.T)
+
+
 def _top_pairs(
     scheduled: torch.Tensor,
     confidence: torch.Tensor,
     max_pairs: int,
+    selection: str,
 ) -> list[tuple[int, int]]:
+    pairs = list(itertools.combinations([int(x) for x in scheduled.tolist()], 2))
+    if selection == "any":
+        return pairs[:max_pairs]
+
     scored = []
-    for i, j in itertools.combinations([int(x) for x in scheduled.tolist()], 2):
+    for i, j in pairs:
         scored.append((float((confidence[i] + confidence[j]).item()), i, j))
     scored.sort(key=lambda item: item[0], reverse=True)
     return [(i, j) for _, i, j in scored[:max_pairs]]
@@ -45,9 +73,15 @@ def collect_step(
     shift_logits: bool,
     tokens_per_step: int,
     max_pairs: int,
+    pair_selection: str,
     batch_size: int,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor]:
-    logits, hidden = forward_logits_hidden(model, x, shift_logits)
+    logits, hidden, attentions = forward_logits_hidden(
+        model,
+        x,
+        shift_logits,
+        return_attentions=True,
+    )
     require_finite("base logits", logits)
     require_finite("base hidden states", hidden)
 
@@ -55,15 +89,23 @@ def collect_step(
     log_p = log_probs_without_mask(masked_logits, mask_id)
     p = log_p.exp()
     confidence, top_ids = p.max(dim=-1)
-    order = torch.argsort(confidence, descending=True)
-    scheduled = order[: min(tokens_per_step, len(mask_pos))]
-    ranks = {int(idx): rank for rank, idx in enumerate(order.tolist())}
+    confidence_order = torch.argsort(confidence, descending=True)
+    if pair_selection == "any":
+        scheduled = torch.arange(
+            min(tokens_per_step, len(mask_pos)),
+            device=mask_pos.device,
+            dtype=torch.long,
+        )
+    else:
+        scheduled = confidence_order[: min(tokens_per_step, len(mask_pos))]
+    ranks = {int(idx): rank for rank, idx in enumerate(confidence_order.tolist())}
 
     hidden_cos = _cosine_matrix(hidden[0, mask_pos])
     logit_vec = masked_logits.clone()
     logit_vec[:, mask_id] = 0
     logit_cos = _cosine_matrix(logit_vec)
-    pairs = _top_pairs(scheduled, confidence, max_pairs)
+    attention_score = _attention_matrix(attentions, mask_pos, x.device)
+    pairs = _top_pairs(scheduled, confidence, max_pairs, pair_selection)
 
     records = []
     for start in range(0, len(pairs), batch_size):
@@ -75,7 +117,7 @@ def collect_step(
             x_cond[2 * row + 1, mask_pos[i]] = int(top_ids[i])
             target_pos.extend([int(mask_pos[i]), int(mask_pos[j])])
 
-        cond_logits, _ = forward_logits_hidden(model, x_cond, shift_logits)
+        cond_logits, _, _ = forward_logits_hidden(model, x_cond, shift_logits)
         rows = torch.arange(len(target_pos), device=x.device)
         targets = torch.tensor(target_pos, dtype=torch.long, device=x.device)
         cond_log_p = log_probs_without_mask(cond_logits[rows, targets], mask_id)
@@ -100,6 +142,8 @@ def collect_step(
                     "token_j": int(top_ids[j]),
                     "confidence_i": float(confidence[i]),
                     "confidence_j": float(confidence[j]),
+                    "pair_selection": pair_selection,
+                    "attention_score": float(attention_score[i, j]),
                     "hidden_cosine": float(hidden_cos[i, j]),
                     "logit_cosine": float(logit_cos[i, j]),
                     "kl_i_given_j": float(kl_i),
@@ -119,7 +163,10 @@ def collect_sample(model, tokenizer, sample, mask_id: int, device: str, args):
     sample_idx = sample.metadata.get("sample_idx", 0)
     records = []
 
-    for step in range(args.generation_steps):
+    max_steps = 1 if args.single_forward_only else args.generation_steps
+    forward_mode = "single_forward" if args.single_forward_only else "iterative"
+
+    for step in range(max_steps):
         mask_pos = (x[0] == mask_id).nonzero(as_tuple=False).flatten()
         if len(mask_pos) == 0:
             break
@@ -135,9 +182,13 @@ def collect_sample(model, tokenizer, sample, mask_id: int, device: str, args):
             shift_logits=args.shift_logits_resolved,
             tokens_per_step=args.tokens_per_step,
             max_pairs=args.max_pairs_per_step,
+            pair_selection=args.pair_selection,
             batch_size=max(1, args.condition_batch_size),
         )
+        for row in rows:
+            row["forward_mode"] = forward_mode
         records.extend(rows)
+        if args.single_forward_only:
+            break
         x[0, mask_pos[scheduled]] = top_ids[scheduled]
     return records
-

@@ -6,6 +6,7 @@ import os
 import site
 import sys
 from contextlib import nullcontext
+import inspect
 from pathlib import Path
 
 import torch
@@ -14,8 +15,38 @@ import torch
 FORCE_MATH_SDPA = False
 
 
-def repo_root() -> Path:
+def experiment_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def repo_root() -> Path:
+    """Return the workspace root that contains models and sibling repos."""
+    return Path(__file__).resolve().parents[3]
+
+
+def resolve_model_path(model_name: str | os.PathLike[str]) -> str:
+    """Resolve HF-style model names to local sibling directories when available."""
+    raw = Path(model_name).expanduser()
+    candidates = [raw]
+    if not raw.is_absolute():
+        for root in (repo_root(), experiment_root()):
+            candidates.append(root / raw)
+        if raw.name != str(raw):
+            for root in (repo_root(), experiment_root()):
+                candidates.append(root / raw.name)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    return str(model_name)
+
+
+def default_model_path(*candidates: str) -> str:
+    for candidate in candidates:
+        resolved = resolve_model_path(candidate)
+        if Path(resolved).exists():
+            return resolved
+    return candidates[0]
 
 
 def resolve_shift_logits(mode: str, model_name: str) -> bool:
@@ -145,8 +176,7 @@ def load_dream_model(args):
     _patch_rope_default()
     _patch_generation_update()
 
-    model_path = Path(args.model)
-    model_id = str(model_path if model_path.exists() else args.model)
+    model_id = resolve_model_path(args.model)
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
     if device == "auto":
         device = "cpu"
@@ -176,12 +206,29 @@ def load_dream_model(args):
     return model, tokenizer, int(mask_id), device
 
 
-def forward_logits_hidden(model, input_ids, shift_logits: bool):
+def forward_logits_hidden(
+    model,
+    input_ids,
+    shift_logits: bool,
+    return_attentions: bool = False,
+):
     position_ids = torch.arange(
         input_ids.shape[-1],
         dtype=torch.long,
         device=input_ids.device,
     ).unsqueeze(0).expand(input_ids.shape[0], -1)
+    forward_params = inspect.signature(model.forward).parameters
+    model_kwargs = {
+        "input_ids": input_ids,
+        "output_hidden_states": True,
+        "return_dict": True,
+    }
+    if "position_ids" in forward_params:
+        model_kwargs["position_ids"] = position_ids
+    if "use_cache" in forward_params:
+        model_kwargs["use_cache"] = False
+    if return_attentions and "output_attentions" in forward_params:
+        model_kwargs["output_attentions"] = True
 
     context = nullcontext()
     if input_ids.device.type == "cuda" and FORCE_MATH_SDPA:
@@ -193,13 +240,17 @@ def forward_logits_hidden(model, input_ids, shift_logits: bool):
             context = nullcontext()
 
     with context:
-        output = model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            output_hidden_states=True,
-            return_dict=True,
-            use_cache=False,
-        )
+        try:
+            output = model(**model_kwargs)
+        except ValueError as exc:
+            if not (
+                return_attentions
+                and model_kwargs.get("output_attentions")
+                and "output_attentions" in str(exc)
+            ):
+                raise
+            model_kwargs.pop("output_attentions", None)
+            output = model(**model_kwargs)
 
     logits = output.logits
     if shift_logits:
@@ -208,5 +259,5 @@ def forward_logits_hidden(model, input_ids, shift_logits: bool):
     hidden = output.hidden_states
     if isinstance(hidden, (tuple, list)):
         hidden = hidden[-1]
-    return logits, hidden
-
+    attentions = getattr(output, "attentions", None) if return_attentions else None
+    return logits, hidden, attentions

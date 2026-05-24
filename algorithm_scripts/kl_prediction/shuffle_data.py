@@ -29,37 +29,49 @@ def _load_words(path: Path) -> list[str]:
     return data
 
 
-def _task_config(root: Path) -> dict:
+def _task_config(root: Path, task_name: str) -> dict:
     path = root / (
         "ParallelBench/parallelbench/datasets/data/task_configs/test/"
         "waiting_line.yaml"
     )
     raw = yaml.safe_load(path.read_text())
-    cfg = {**raw["global_config"], **raw["tasks"]["shuffle"]}
+    cfg = {**raw["global_config"], **raw["tasks"][task_name]}
     words_path = root / "ParallelBench/parallelbench/datasets/data/resources" / cfg["words"]
     cfg["words"] = _load_words(words_path)
     return cfg
 
 
-def _make_shuffle_sample(rng: random.Random, cfg: dict) -> dict:
+def _answer_text(answer) -> str:
+    return answer if isinstance(answer, str) else answer["example"]
+
+
+def _make_waiting_line_sample(rng: random.Random, cfg: dict) -> dict:
     length = rng.randint(cfg["min_length"], cfg["max_length"])
     base = rng.sample(cfg["words"], length)
-    shuffled = base[:]
-    while shuffled == base and len(set(base)) > 1:
-        rng.shuffle(shuffled)
+    target = base[:]
+    if cfg["type"] == "shuffle":
+        while target == base and len(set(base)) > 1:
+            rng.shuffle(target)
+    elif cfg["type"] != "copy":
+        raise ValueError(f"Unsupported waiting line task type: {cfg['type']}")
     return {
         "input": {"context": _list_text(base)},
-        "target": _list_text(shuffled),
+        "target": _list_text(target),
         "metadata": {"length": length},
     }
 
 
-def load_shuffle_sample(root: Path, sample_idx: int, seed: int) -> ProbeSample:
-    cfg = _task_config(root)
+def load_waiting_line_sample(
+    root: Path,
+    task_name: str,
+    sample_idx: int,
+    seed: int,
+) -> ProbeSample:
+    cfg = _task_config(root, task_name)
     rng = random.Random(seed)
     sample = None
     for _ in range(sample_idx + 1):
-        sample = _make_shuffle_sample(rng, cfg)
+        sample = _make_waiting_line_sample(rng, cfg)
     assert sample is not None
 
     icl = cfg["icl_example"]
@@ -69,7 +81,7 @@ def load_shuffle_sample(root: Path, sample_idx: int, seed: int) -> ProbeSample:
             "role": "user",
             "content": cfg["prompt"].format(**icl["input"]).replace("\\n", "\n"),
         },
-        {"role": "assistant", "content": icl["answer"]["example"]},
+        {"role": "assistant", "content": _answer_text(icl["answer"])},
         {"role": "user", "content": prompt},
     ]
     return ProbeSample(
@@ -78,3 +90,6 @@ def load_shuffle_sample(root: Path, sample_idx: int, seed: int) -> ProbeSample:
         metadata=sample["metadata"],
     )
 
+
+def load_shuffle_sample(root: Path, sample_idx: int, seed: int) -> ProbeSample:
+    return load_waiting_line_sample(root, "shuffle", sample_idx, seed)

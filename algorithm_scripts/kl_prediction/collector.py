@@ -81,7 +81,7 @@ def pair_kl_records(
     max_pairs: int,
     tokens_per_step: int,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, list[torch.Tensor], list[float]]:
-    logits, hidden = forward_logits_hidden(model, x, shift_logits)
+    logits, hidden, _ = forward_logits_hidden(model, x, shift_logits)
     require_finite("base logits", logits)
     require_finite("base hidden states", hidden)
 
@@ -114,7 +114,7 @@ def pair_kl_records(
         for row, (_, _, anchor, _) in enumerate(batch):
             x_cond[row, mask_pos[anchor]] = int(top_ids[anchor])
 
-        cond_logits, _ = forward_logits_hidden(model, x_cond, shift_logits)
+        cond_logits, _, _ = forward_logits_hidden(model, x_cond, shift_logits)
         require_finite("conditioned logits", cond_logits)
         rows = torch.arange(len(batch), device=x.device)
         target_pos = torch.tensor(
